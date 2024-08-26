@@ -165,10 +165,10 @@ func (c *Cache) Set(k, v []byte) {
 //
 // k contents may be modified after returning from Get.
 // 如果 dst 为 nil，则 Get 方法会为返回的值分配一个新的字节切片
-func (c *Cache) Get(dst, k []byte) []byte {
-	h := xxhash.Sum64(k)
-	idx := h % bucketsCount
-	dst, _ = c.buckets[idx].Get(dst, k, h, true)
+func (c *Cache) Get(dst, key []byte) []byte {
+	hash := xxhash.Sum64(key)
+	idx := hash % bucketsCount
+	dst, _ = c.buckets[idx].Get(dst, key, hash, true)
 	return dst
 }
 
@@ -352,29 +352,40 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	needClean := false
 	b.mu.Lock()
 	idx := b.idx
-	//
+	//计算新的写入位置：idxNew 是在当前索引 idx 的基础上加上 kvLen（键值对的总长度），计算出插入操作后的新位置。
 	idxNew := idx + kvLen
 	//计算 chunkIdx（当前块索引）和 chunkIdxNew（新块索引）
 	chunkIdx := idx / chunkSize
 	chunkIdxNew := idxNew / chunkSize
-	//如果新块索引超出了现有块的范围：
+	//如果新块索引超出了现有块的范围，需要新创建块
 	//如果超出块数组长度，重置索引和长度，增加生成代数 b.gen，并可能清理旧块。
 	//否则，调整当前块的起始索引
 	if chunkIdxNew > chunkIdx {
+		// 如果新的块索引 chunkIdxNew 超过了当前已分配的块的数量（即 chunks 切片的长度），说明需要重新初始化块
 		if chunkIdxNew >= uint64(len(chunks)) {
+			//将 idx 和 chunkIdx 重置为 0，并将 idxNew 设为 kvLen，这表示从新的块开始写入数据
 			idx = 0
 			idxNew = kvLen
 			chunkIdx = 0
+			//b.gen 是用于生成新的块标识符的代数。增加生成代数，并在生成代数满足一定条件时（如位掩码操作），进行额外的增加操作。
+			//这通常用于生成唯一的块版本标识符，帮助区分不同版本的块
 			b.gen++
 			if b.gen&((1<<genSizeBits)-1) == 0 {
 				b.gen++
 			}
+			//设定 needClean 为 true，表示需要清理旧的块（或做其他必要的管理操作），这通常是在块已满或达到一定的容量时进行的维护操作
 			needClean = true
 		} else {
+			//如果 chunkIdxNew 没有超过现有块的数量，则更新当前索引 idx 和新的索引 idxNew，并设置 chunkIdx 为 chunkIdxNew。
+			//这表示继续在当前块内写入数据，更新索引以反映新的写入位置
 			idx = chunkIdxNew * chunkSize
 			idxNew = idx + kvLen
 			chunkIdx = chunkIdxNew
 		}
+		//清空当前块 chunks[chunkIdx] 的内容。
+		//虽然 chunks[chunkIdx] 被重新分配内存，
+		//但这一步骤确保当前块的内容被清空，以便新的数据可以被正确地追加到块中
+		// todo:2024/8/26 为什么要清理当前块数据
 		chunks[chunkIdx] = chunks[chunkIdx][:0]
 	}
 	//获取或创建块 chunk。
@@ -399,56 +410,69 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	b.mu.Unlock()
 }
 
-func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
+func (b *bucket) Get(dst, key []byte, hash uint64, returnDst bool) ([]byte, bool) {
 	atomic.AddUint64(&b.getCalls, 1)
+	// 初始化 found 变量为 false，表示默认没有找到匹配的数据
 	found := false
 	chunks := b.chunks
-	b.mu.RLock()
-	v := b.m[h]
+	b.mu.RLock()       // 获取只读锁，确保线程安全地访问 b.m 和 b.gen
+	value := b.m[hash] // 从 b.m 中根据 hash 查找对应的值
+	// bGen 获取当前桶的生成代数，确保正确的桶版本被访问
+	// 通过位掩码 (1 << genSizeBits) - 1，bGen 提取了 b.gen 的低 genSizeBits 位。这个掩码确保只保留生成代数的有效部分，忽略其他位
 	bGen := b.gen & ((1 << genSizeBits) - 1)
-	if v > 0 {
-		gen := v >> bucketSizeBits
-		idx := v & ((1 << bucketSizeBits) - 1)
+
+	if value > 0 { // 如果 value 大于 0，说明存在可能的有效数据
+		// 检查 v 是否有效且符合当前代数 bGen
+		// 从 value 中提取生成代数 gen 和索引 idx。bucketSizeBits 表示索引部分的位数
+		gen := value >> bucketSizeBits
+		idx := value & ((1 << bucketSizeBits) - 1)
+		// 检查提取的生成代数和索引是否有效。确保数据没有被回收或被其他操作覆盖
 		if gen == bGen && idx < b.idx || gen+1 == bGen && idx >= b.idx || gen == maxGen && bGen == 1 && idx >= b.idx {
+			// 计算数据块的索引
 			chunkIdx := idx / chunkSize
 			if chunkIdx >= uint64(len(chunks)) {
-				// Corrupted data during the load from file. Just skip it.
+				// 如果计算出的 chunkIdx 超出了 chunks 的范围，说明数据可能在文件加载过程中被损坏。
+				// 增加腐败计数器，然后跳转到 end 标签以解锁资源并返回。
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
 			chunk := chunks[chunkIdx]
 			idx %= chunkSize
 			if idx+4 >= chunkSize {
-				// Corrupted data during the load from file. Just skip it.
+				// 如果计算出的索引加上 4 超出了 chunk 的范围，说明数据可能在文件加载过程中被损坏。
+				// 增加腐败计数器，然后跳转到 end 标签以解锁资源并返回。
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
-			kvLenBuf := chunk[idx : idx+4]
-			keyLen := (uint64(kvLenBuf[0]) << 8) | uint64(kvLenBuf[1])
-			valLen := (uint64(kvLenBuf[2]) << 8) | uint64(kvLenBuf[3])
+			kvLenBuf := chunk[idx : idx+4]                             // 提取包含键值长度的 4 字节数据
+			keyLen := (uint64(kvLenBuf[0]) << 8) | uint64(kvLenBuf[1]) // 解析键的长度
+			valLen := (uint64(kvLenBuf[2]) << 8) | uint64(kvLenBuf[3]) // 解析值的长度
 			idx += 4
 			if idx+keyLen+valLen >= chunkSize {
-				// Corrupted data during the load from file. Just skip it.
+				// 如果计算出的索引加上 keyLen 和 valLen 超出了 chunk 的范围，说明数据可能在文件加载过程中被损坏。
+				// 增加腐败计数器，然后跳转到 end 标签以解锁资源并返回。
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
-			if string(k) == string(chunk[idx:idx+keyLen]) {
+			if string(key) == string(chunk[idx:idx+keyLen]) { // 如果键匹配
 				idx += keyLen
-				if returnDst {
+				if returnDst { // 如果 returnDst 为 true，将值追加到 dst
 					dst = append(dst, chunk[idx:idx+valLen]...)
 				}
 				found = true
 			} else {
+				// 如果键不匹配，增加冲突计数器
 				atomic.AddUint64(&b.collisions, 1)
 			}
 		}
 	}
 end:
-	b.mu.RUnlock()
+	b.mu.RUnlock() // 释放只读锁
 	if !found {
+		// 如果没有找到匹配项，增加未命中计数器
 		atomic.AddUint64(&b.misses, 1)
 	}
-	return dst, found
+	return dst, found // 返回结果
 }
 
 func (b *bucket) Del(h uint64) {
