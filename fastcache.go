@@ -11,16 +11,20 @@ import (
 	xxhash "github.com/cespare/xxhash/v2"
 )
 
+// 512个分片
 const bucketsCount = 512
 
+// 块大小
 const chunkSize = 64 * 1024
 
+// 40个比特位
 const bucketSizeBits = 40
 
 const genSizeBits = 64 - bucketSizeBits
 
 const maxGen = 1<<genSizeBits - 1
 
+// 每个桶最大为1TB
 const maxBucketSize uint64 = 1 << bucketSizeBits
 
 // Stats represents cache stats.
@@ -125,7 +129,9 @@ func New(maxBytes int) *Cache {
 		panic(fmt.Errorf("maxBytes must be greater than 0; got %d", maxBytes))
 	}
 	var c Cache
+	// 计算每个桶能够存储的最大字节数
 	maxBucketBytes := uint64((maxBytes + bucketsCount - 1) / bucketsCount)
+	// 初始化每个桶的容量
 	for i := range c.buckets[:] {
 		c.buckets[i].Init(maxBucketBytes)
 	}
@@ -158,6 +164,7 @@ func (c *Cache) Set(k, v []byte) {
 // Get returns only values stored in c via Set.
 //
 // k contents may be modified after returning from Get.
+// 如果 dst 为 nil，则 Get 方法会为返回的值分配一个新的字节切片
 func (c *Cache) Get(dst, k []byte) []byte {
 	h := xxhash.Sum64(k)
 	idx := h % bucketsCount
@@ -241,6 +248,7 @@ func (b *bucket) Init(maxBytes uint64) {
 	if maxBytes == 0 {
 		panic(fmt.Errorf("maxBytes cannot be zero"))
 	}
+	// 每个桶最大为1TB
 	if maxBytes >= maxBucketSize {
 		panic(fmt.Errorf("too big maxBytes=%d; should be smaller than %d", maxBytes, maxBucketSize))
 	}
@@ -315,18 +323,25 @@ func (b *bucket) UpdateStats(s *Stats) {
 }
 
 func (b *bucket) Set(k, v []byte, h uint64) {
+	// 原子地增加存储调用次数计数器
 	atomic.AddUint64(&b.setCalls, 1)
+	// 如果键 k 或值 v 的长度大于等于 65536（1<<16），方法会返回，因为这些长度超出了用两个字节编码的范围
 	if len(k) >= (1<<16) || len(v) >= (1<<16) {
 		// Too big key or value - its length cannot be encoded
 		// with 2 bytes (see below). Skip the entry.
 		return
 	}
+	// 长度信息是用 16 位整数表示的，因此需要两个字节来存储它。高 8 位和低 8 位分别存储在两个字节中
+	//vLenBuf：用 4 字节存储键和值的长度（各用 2 字节编码），分别存储键的高 8 位和低 8 位长度，以及值的高 8 位和低 8 位长度。
 	var kvLenBuf [4]byte
 	kvLenBuf[0] = byte(uint16(len(k)) >> 8)
+	// byte(len(k)) 只保留了 len(k) 的低 8 位
 	kvLenBuf[1] = byte(len(k))
 	kvLenBuf[2] = byte(uint16(len(v)) >> 8)
 	kvLenBuf[3] = byte(len(v))
+	//kvLen：计算键值对的总长度，包括 kvLenBuf、键 k 和值 v 的长度
 	kvLen := uint64(len(kvLenBuf) + len(k) + len(v))
+	// 如果 kvLen 大于或等于 chunkSize（块大小），方法返回，因为键值对太大，不能存储在一个块中
 	if kvLen >= chunkSize {
 		// Do not store too big keys and values, since they do not
 		// fit a chunk.
@@ -337,9 +352,14 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	needClean := false
 	b.mu.Lock()
 	idx := b.idx
+	//
 	idxNew := idx + kvLen
+	//计算 chunkIdx（当前块索引）和 chunkIdxNew（新块索引）
 	chunkIdx := idx / chunkSize
 	chunkIdxNew := idxNew / chunkSize
+	//如果新块索引超出了现有块的范围：
+	//如果超出块数组长度，重置索引和长度，增加生成代数 b.gen，并可能清理旧块。
+	//否则，调整当前块的起始索引
 	if chunkIdxNew > chunkIdx {
 		if chunkIdxNew >= uint64(len(chunks)) {
 			idx = 0
@@ -357,16 +377,21 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 		}
 		chunks[chunkIdx] = chunks[chunkIdx][:0]
 	}
+	//获取或创建块 chunk。
 	chunk := chunks[chunkIdx]
 	if chunk == nil {
 		chunk = getChunk()
 		chunk = chunk[:0]
 	}
+	//将 kvLenBuf、键 k 和值 v 附加到块中。
 	chunk = append(chunk, kvLenBuf[:]...)
 	chunk = append(chunk, k...)
 	chunk = append(chunk, v...)
+	//更新 chunks[chunkIdx] 为新的块内容。
 	chunks[chunkIdx] = chunk
+	//更新哈希表 b.m 以映射哈希值 h 到当前的存储位置和生成代数。
 	b.m[h] = idx | (b.gen << bucketSizeBits)
+	//更新桶的索引 b.idx 为新的位置
 	b.idx = idxNew
 	if needClean {
 		b.cleanLocked()
