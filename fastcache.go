@@ -11,21 +11,23 @@ import (
 	xxhash "github.com/cespare/xxhash/v2"
 )
 
-// 512个分片
+// 每个缓存中的桶数量
 const bucketsCount = 512
 
-// 块大小
-const chunkSize = 64 * 1024
-
-// 40个比特位
+// 桶的大小 (用变量的前 40 位表示)
 const bucketSizeBits = 40
 
+// 桶的数据存储环形缓冲区的重写次数 (用变量的后 24 位表示)
 const genSizeBits = 64 - bucketSizeBits
 
+// 桶的数据存储最大重写次数
 const maxGen = 1<<genSizeBits - 1
 
 // 每个桶最大为1TB
 const maxBucketSize uint64 = 1 << bucketSizeBits
+
+// 每个桶中的单个数据块大小 64KB
+const chunkSize = 64 * 1024
 
 // Stats represents cache stats.
 //
@@ -222,25 +224,33 @@ func (c *Cache) UpdateStats(s *Stats) {
 }
 
 type bucket struct {
+	// 读写锁，涉及到并发操作时使用
 	mu sync.RWMutex
 
-	// chunks is a ring buffer with encoded (k, v) pairs.
-	// It consists of 64KB chunks.
+	// 存放数据的二维数组，是一个环形缓冲区 (也可以理解为一个环形链表)
+	//
 	chunks [][]byte
 
-	// m maps hash(k) to idx of (k, v) pair in chunks.
+	// 数据哈希索引
+	// 用于快速为指定 key 找到对应的存储位置
 	m map[uint64]uint64
 
-	// idx points to chunks for writing the next (k, v) pair.
+	// 数据索引计数器，从0开始算，当前写入到哪个位置
 	idx uint64
 
-	// gen is the generation of chunks.
+	// 表示二维数组被重写的次数
+	// 用于校验环形缓冲区的数据有效性
 	gen uint64
 
-	getCalls    uint64
-	setCalls    uint64
-	misses      uint64
-	collisions  uint64
+	// Get 操作次数
+	getCalls uint64
+	// Set 操作次数
+	setCalls uint64
+	// 未命中次数
+	misses uint64
+	// 哈希碰撞次数
+	collisions uint64
+	// 数据异常次数
 	corruptions uint64
 }
 
@@ -252,6 +262,7 @@ func (b *bucket) Init(maxBytes uint64) {
 	if maxBytes >= maxBucketSize {
 		panic(fmt.Errorf("too big maxBytes=%d; should be smaller than %d", maxBytes, maxBucketSize))
 	}
+	// 每个bucket最多这么多个存储块
 	maxChunks := (maxBytes + chunkSize - 1) / chunkSize
 	b.chunks = make([][]byte, maxChunks)
 	b.m = make(map[uint64]uint64)
@@ -322,25 +333,25 @@ func (b *bucket) UpdateStats(s *Stats) {
 	b.mu.RUnlock()
 }
 
-func (b *bucket) Set(k, v []byte, h uint64) {
+func (b *bucket) Set(key, value []byte, h uint64) {
 	// 原子地增加存储调用次数计数器
 	atomic.AddUint64(&b.setCalls, 1)
-	// 如果键 k 或值 v 的长度大于等于 65536（1<<16），方法会返回，因为这些长度超出了用两个字节编码的范围
-	if len(k) >= (1<<16) || len(v) >= (1<<16) {
+	// 先行判断key、value大小，如果键 k 或值 v 的长度大于等于 65536（1<<16），方法会返回，因为下面的代码限制了只用16位存key和value
+	if len(key) >= (1<<16) || len(value) >= (1<<16) {
 		// Too big key or value - its length cannot be encoded
 		// with 2 bytes (see below). Skip the entry.
 		return
 	}
-	// 长度信息是用 16 位整数表示的，因此需要两个字节来存储它。高 8 位和低 8 位分别存储在两个字节中
-	//vLenBuf：用 4 字节存储键和值的长度（各用 2 字节编码），分别存储键的高 8 位和低 8 位长度，以及值的高 8 位和低 8 位长度。
+	// zhmark kvLenBuf 表示 {key + value} 的指纹
+	//vLenBuf：用 4 字节存储键和值的长度（各用 2 字节编码），分别存储键的高 8 位和低 8 位长度，以及值的高 8 位和低 8 位长度，作为指纹
 	var kvLenBuf [4]byte
-	kvLenBuf[0] = byte(uint16(len(k)) >> 8)
+	kvLenBuf[0] = byte(uint16(len(key)) >> 8)
 	// byte(len(k)) 只保留了 len(k) 的低 8 位
-	kvLenBuf[1] = byte(len(k))
-	kvLenBuf[2] = byte(uint16(len(v)) >> 8)
-	kvLenBuf[3] = byte(len(v))
+	kvLenBuf[1] = byte(len(key))
+	kvLenBuf[2] = byte(uint16(len(value)) >> 8)
+	kvLenBuf[3] = byte(len(value))
 	//kvLen：计算键值对的总长度，包括 kvLenBuf、键 k 和值 v 的长度
-	kvLen := uint64(len(kvLenBuf) + len(k) + len(v))
+	kvLen := uint64(len(kvLenBuf) + len(key) + len(value))
 	// 如果 kvLen 大于或等于 chunkSize（块大小），方法返回，因为键值对太大，不能存储在一个块中
 	if kvLen >= chunkSize {
 		// Do not store too big keys and values, since they do not
@@ -360,9 +371,12 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	//如果新块索引超出了现有块的范围，需要新创建块
 	//如果超出块数组长度，重置索引和长度，增加生成代数 b.gen，并可能清理旧块。
 	//否则，调整当前块的起始索引
+
 	if chunkIdxNew > chunkIdx {
 		// 如果新的块索引 chunkIdxNew 超过了当前已分配的块的数量（即 chunks 切片的长度），说明需要重新初始化块
+		//如果下一个数据块的索引 大于 数据块的数量
 		if chunkIdxNew >= uint64(len(chunks)) {
+			// 此时采用环形缓冲区的方式: 从头开始存储数据
 			//将 idx 和 chunkIdx 重置为 0，并将 idxNew 设为 kvLen，这表示从新的块开始写入数据
 			idx = 0
 			idxNew = kvLen
@@ -370,6 +384,10 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 			//b.gen 是用于生成新的块标识符的代数。增加生成代数，并在生成代数满足一定条件时（如位掩码操作），进行额外的增加操作。
 			//这通常用于生成唯一的块版本标识符，帮助区分不同版本的块
 			b.gen++
+
+			// 如果重写次数达到上限，那么重新开始计算
+			// (1<<genSizeBits)-1 1先移位genSizeBits，再-1，生成genSizeBits个1
+			// b.gen&(1<<genSizeBits)-1，表示取b.gen的低genSizeBits位，如果低genSizeBits位都是0，
 			if b.gen&((1<<genSizeBits)-1) == 0 {
 				b.gen++
 			}
@@ -394,29 +412,42 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 		chunk = getChunk()
 		chunk = chunk[:0]
 	}
-	//将 kvLenBuf、键 k 和值 v 附加到块中。
+
+	// 指纹写入数据块
 	chunk = append(chunk, kvLenBuf[:]...)
-	chunk = append(chunk, k...)
-	chunk = append(chunk, v...)
-	//更新 chunks[chunkIdx] 为新的块内容。
+	// key 写入数据块
+	chunk = append(chunk, key...)
+	// value 写入数据块
+	chunk = append(chunk, value...)
+	// 更新数据块信息
 	chunks[chunkIdx] = chunk
+
 	//更新哈希表 b.m 以映射哈希值 h 到当前的存储位置和生成代数。
 	b.m[h] = idx | (b.gen << bucketSizeBits)
 	//更新桶的索引 b.idx 为新的位置
 	b.idx = idxNew
 	if needClean {
+		// 如果缓冲区重写了，重新解析和构建数据哈希索引
 		b.cleanLocked()
 	}
 	b.mu.Unlock()
 }
 
+/*
+*
+
+	zhmark 2024/8/26
+	1.
+
+*
+*/
 func (b *bucket) Get(dst, key []byte, hash uint64, returnDst bool) ([]byte, bool) {
 	atomic.AddUint64(&b.getCalls, 1)
 	// 初始化 found 变量为 false，表示默认没有找到匹配的数据
 	found := false
 	chunks := b.chunks
-	b.mu.RLock()       // 获取只读锁，确保线程安全地访问 b.m 和 b.gen
-	value := b.m[hash] // 从 b.m 中根据 hash 查找对应的值
+	b.mu.RLock()
+	value := b.m[hash]
 	// bGen 获取当前桶的生成代数，确保正确的桶版本被访问
 	// 通过位掩码 (1 << genSizeBits) - 1，bGen 提取了 b.gen 的低 genSizeBits 位。这个掩码确保只保留生成代数的有效部分，忽略其他位
 	bGen := b.gen & ((1 << genSizeBits) - 1)
