@@ -238,8 +238,10 @@ type bucket struct {
 	// 数据索引计数器，从0开始算，当前写入到哪个位置
 	idx uint64
 
+	// zhmark 当 chunks 写满后, gen 会 +1, 表示循环次数
 	// 表示二维数组被重写的次数
 	// 用于校验环形缓冲区的数据有效性
+	// 只用后24位
 	gen uint64
 
 	// Get 操作次数
@@ -422,7 +424,9 @@ func (b *bucket) Set(key, value []byte, h uint64) {
 	// 更新数据块信息
 	chunks[chunkIdx] = chunk
 
-	//更新哈希表 b.m 以映射哈希值 h 到当前的存储位置和生成代数。
+	// 更新哈希表 b.m 以映射哈希值 h 到当前的存储位置和版本号
+	// b.gen只用后24位，左移40位后，b.gen的值完全位于最右边
+	// 再和idx或一下，即把gen的高位放到idx里，两个值能存一起
 	b.m[h] = idx | (b.gen << bucketSizeBits)
 	//更新桶的索引 b.idx 为新的位置
 	b.idx = idxNew
@@ -447,18 +451,21 @@ func (b *bucket) Get(dst, key []byte, hash uint64, returnDst bool) ([]byte, bool
 	found := false
 	chunks := b.chunks
 	b.mu.RLock()
-	value := b.m[hash]
-	// bGen 获取当前桶的生成代数，确保正确的桶版本被访问
+	mapValueGenIdx := b.m[hash]
+	// bGen 获取当前bucket的版本号，防止因为覆盖写被误读取
 	// 通过位掩码 (1 << genSizeBits) - 1，bGen 提取了 b.gen 的低 genSizeBits 位。这个掩码确保只保留生成代数的有效部分，忽略其他位
-	bGen := b.gen & ((1 << genSizeBits) - 1)
+	currentGen := b.gen & ((1 << genSizeBits) - 1)
 
-	if value > 0 { // 如果 value 大于 0，说明存在可能的有效数据
+	if mapValueGenIdx > 0 { // 如果 value 大于 0，说明存在可能的有效数据
 		// 检查 v 是否有效且符合当前代数 bGen
 		// 从 value 中提取生成代数 gen 和索引 idx。bucketSizeBits 表示索引部分的位数
-		gen := value >> bucketSizeBits
-		idx := value & ((1 << bucketSizeBits) - 1)
+		gen := mapValueGenIdx >> bucketSizeBits
+		idx := mapValueGenIdx & ((1 << bucketSizeBits) - 1)
 		// 检查提取的生成代数和索引是否有效。确保数据没有被回收或被其他操作覆盖
-		if gen == bGen && idx < b.idx || gen+1 == bGen && idx >= b.idx || gen == maxGen && bGen == 1 && idx >= b.idx {
+		// gen == bGen && idx < b.idx: 如果当前的桶版本号一致，并且索引小于当前的，那么是OK的
+		// gen+1 == bGen && idx >= b.idx：如果桶版本号比当前版本号低，但是idx比当前idx高，说明还没被覆盖，还是可以读取的
+		// gen == maxGen && currentGen == 1 && idx >= b.idx：如果达到最大版本，但是当前又是重写到1了，idx比当前idx高，说明还没被覆盖，还是可以读取的
+		if (gen == currentGen && idx < b.idx) || (gen+1 == currentGen && idx >= b.idx) || (gen == maxGen && currentGen == 1 && idx >= b.idx) {
 			// 计算数据块的索引
 			chunkIdx := idx / chunkSize
 			if chunkIdx >= uint64(len(chunks)) {
@@ -470,7 +477,7 @@ func (b *bucket) Get(dst, key []byte, hash uint64, returnDst bool) ([]byte, bool
 			chunk := chunks[chunkIdx]
 			idx %= chunkSize
 			if idx+4 >= chunkSize {
-				// 如果计算出的索引加上 4 超出了 chunk 的范围，说明数据可能在文件加载过程中被损坏。
+				// 如果计算出的索引加上 4个字节 超出了 chunk 的范围，说明数据可能在文件加载过程中被损坏。
 				// 增加腐败计数器，然后跳转到 end 标签以解锁资源并返回。
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
@@ -485,7 +492,7 @@ func (b *bucket) Get(dst, key []byte, hash uint64, returnDst bool) ([]byte, bool
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
-			if string(key) == string(chunk[idx:idx+keyLen]) { // 如果键匹配
+			if string(key) == string(chunk[idx:idx+keyLen]) { // 如果键匹配，防止hash碰撞
 				idx += keyLen
 				if returnDst { // 如果 returnDst 为 true，将值追加到 dst
 					dst = append(dst, chunk[idx:idx+valLen]...)
