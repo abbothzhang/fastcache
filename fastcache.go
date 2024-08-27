@@ -374,22 +374,20 @@ func (b *bucket) Set(key, value []byte, h uint64) {
 	//如果超出块数组长度，重置索引和长度，增加生成代数 b.gen，并可能清理旧块。
 	//否则，调整当前块的起始索引
 
+	// 如果新的块索引 chunkIdxNew 超过了当前已分配的块的数量（即 chunks 切片的长度），说明需要重新初始化块
 	if chunkIdxNew > chunkIdx {
-		// 如果新的块索引 chunkIdxNew 超过了当前已分配的块的数量（即 chunks 切片的长度），说明需要重新初始化块
-		//如果下一个数据块的索引 大于 数据块的数量
+		//如果下一个数据块的索引 大于 数据块的数量，缓存环需要重写
 		if chunkIdxNew >= uint64(len(chunks)) {
 			// 此时采用环形缓冲区的方式: 从头开始存储数据
 			//将 idx 和 chunkIdx 重置为 0，并将 idxNew 设为 kvLen，这表示从新的块开始写入数据
 			idx = 0
 			idxNew = kvLen
 			chunkIdx = 0
-			//b.gen 是用于生成新的块标识符的代数。增加生成代数，并在生成代数满足一定条件时（如位掩码操作），进行额外的增加操作。
-			//这通常用于生成唯一的块版本标识符，帮助区分不同版本的块
+			// 环重写了，版本号要+1
 			b.gen++
-
 			// 如果重写次数达到上限，那么重新开始计算
 			// (1<<genSizeBits)-1 1先移位genSizeBits，再-1，生成genSizeBits个1
-			// b.gen&(1<<genSizeBits)-1，表示取b.gen的低genSizeBits位，如果低genSizeBits位都是0，
+			// b.gen&(1<<genSizeBits)-1，表示取b.gen的低genSizeBits位，如果低genSizeBits位都是0，那么达到了重写次数上限，重置为0，重新+1
 			if b.gen&((1<<genSizeBits)-1) == 0 {
 				b.gen++
 			}
